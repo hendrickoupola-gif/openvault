@@ -781,14 +781,15 @@ async function onMessageReceived(messageId) {
     // Count unprocessed safe messages
     const unprocessedMessages = safeMessages.filter(m => m.idx > lastProcessedId);
 
-    // Extract if we have enough unprocessed messages
-    if (unprocessedMessages.length >= messageCount) {
-        log(`Automatic extraction: ${unprocessedMessages.length} unprocessed messages (threshold: ${messageCount}), excluding last 2`);
+    // Extract only when we have exactly a complete batch (divisible by batch size)
+    // This ensures proper batching - partial batches wait until complete
+    if (unprocessedMessages.length > 0 && unprocessedMessages.length % messageCount === 0) {
+        log(`Automatic extraction: ${unprocessedMessages.length} unprocessed messages (batch size: ${messageCount}), excluding last 2`);
 
         operationState.extractionInProgress = true;
         try {
-            // Extract only the safe message IDs (excluding last user+assistant pair)
-            const safeMessageIds = unprocessedMessages.slice(-messageCount).map(m => m.idx);
+            // Extract the first batch of messages (oldest first, to process in order)
+            const safeMessageIds = unprocessedMessages.slice(0, messageCount).map(m => m.idx);
             await extractMemories(safeMessageIds);
             // Note: No updateInjection() here - it will be called before NEXT generation
             // Newly extracted memories are too recent to include anyway
@@ -798,7 +799,8 @@ async function onMessageReceived(messageId) {
             operationState.extractionInProgress = false;
         }
     } else {
-        log(`Skipping extraction: only ${unprocessedMessages.length} safe unprocessed messages (threshold: ${messageCount})`);
+        const remaining = messageCount - (unprocessedMessages.length % messageCount);
+        log(`Skipping extraction: ${unprocessedMessages.length} unprocessed messages, need ${remaining} more to complete batch of ${messageCount}`);
     }
 }
 
@@ -1044,7 +1046,6 @@ async function callLLMForExtraction(prompt) {
 
     if (!profileId || !ConnectionManagerRequestService) {
         log('No connection profile available for extraction');
-        toastr.warning('Please select an extraction profile in OpenVault settings', 'OpenVault');
         return null;
     }
 
@@ -1255,35 +1256,44 @@ async function extractAllMessages() {
         .filter(idx => !chat[idx].is_system);
 
     // Exclude the last N messages (they'll be handled by regular/automatic extraction)
-    const messagesToExtract = allNonSystemIds.slice(0, -messageCount);
+    let messagesToExtract = allNonSystemIds.slice(0, -messageCount);
+
+    // Only extract complete batches - truncate to nearest multiple of batch size
+    const completeBatches = Math.floor(messagesToExtract.length / messageCount);
+    const completeMessageCount = completeBatches * messageCount;
+    const remainder = messagesToExtract.length - completeMessageCount;
+
+    if (remainder > 0) {
+        log(`Truncating to ${completeBatches} complete batches (${completeMessageCount} messages), leaving ${remainder} for next batch`);
+        messagesToExtract = messagesToExtract.slice(0, completeMessageCount);
+    }
 
     if (messagesToExtract.length === 0) {
-        toastr.warning('No messages to extract (all messages are within the last N)', 'OpenVault');
+        toastr.warning(`No complete batches to extract (need ${messageCount} messages, have ${allNonSystemIds.length - messageCount})`, 'OpenVault');
         return;
     }
 
-    toastr.info(`Extracting ${messagesToExtract.length} messages (excluding last ${messageCount})...`, 'OpenVault');
+    toastr.info(`Extracting ${messagesToExtract.length} messages in ${completeBatches} batches (excluding last ${messageCount + remainder})...`, 'OpenVault');
 
     // Reset last processed to start fresh
     const data = getOpenVaultData();
     data[LAST_PROCESSED_KEY] = -1;
 
     // Process in batches
-    const batchSize = messageCount;
     let totalEvents = 0;
 
-    for (let i = 0; i < messagesToExtract.length; i += batchSize) {
-        const batch = messagesToExtract.slice(i, i + batchSize);
-        const batchNum = Math.floor(i / batchSize) + 1;
-        const totalBatches = Math.ceil(messagesToExtract.length / batchSize);
+    for (let i = 0; i < completeBatches; i++) {
+        const startIdx = i * messageCount;
+        const batch = messagesToExtract.slice(startIdx, startIdx + messageCount);
+        const batchNum = i + 1;
 
         try {
-            log(`Processing batch ${batchNum}/${totalBatches}...`);
+            log(`Processing batch ${batchNum}/${completeBatches}...`);
             const result = await extractMemories(batch);
             totalEvents += result?.events_created || 0;
 
             // Delay between batches to avoid rate limiting
-            if (i + batchSize < messagesToExtract.length) {
+            if (batchNum < completeBatches) {
                 await new Promise(resolve => setTimeout(resolve, 2000));
             }
         } catch (error) {
