@@ -44,6 +44,58 @@ const operationState = {
     pendingInjectionUpdate: false,
 };
 
+// Timeout constants for generation flow
+const RETRIEVAL_TIMEOUT_MS = 30000; // 30 seconds max for retrieval
+const GENERATION_LOCK_TIMEOUT_MS = 120000; // 2 minutes safety timeout
+
+let generationLockTimeout = null;
+
+/**
+ * Wrap a promise with a timeout
+ * @param {Promise} promise - The promise to wrap
+ * @param {number} ms - Timeout in milliseconds
+ * @param {string} operation - Name for error message
+ */
+function withTimeout(promise, ms, operation = 'Operation') {
+    return Promise.race([
+        promise,
+        new Promise((_, reject) =>
+            setTimeout(() => reject(new Error(`${operation} timed out after ${ms}ms`)), ms)
+        )
+    ]);
+}
+
+/**
+ * Set generation lock with safety timeout
+ */
+function setGenerationLock() {
+    operationState.generationInProgress = true;
+
+    // Clear any existing safety timeout
+    if (generationLockTimeout) {
+        clearTimeout(generationLockTimeout);
+    }
+
+    // Set safety timeout - if GENERATION_ENDED doesn't fire, clear the lock anyway
+    generationLockTimeout = setTimeout(() => {
+        if (operationState.generationInProgress) {
+            console.warn('OpenVault: Generation lock timeout - clearing stale lock');
+            operationState.generationInProgress = false;
+        }
+    }, GENERATION_LOCK_TIMEOUT_MS);
+}
+
+/**
+ * Clear generation lock and cancel safety timeout
+ */
+function clearGenerationLock() {
+    operationState.generationInProgress = false;
+    if (generationLockTimeout) {
+        clearTimeout(generationLockTimeout);
+        generationLockTimeout = null;
+    }
+}
+
 /**
  * Get OpenVault data from chat metadata
  * @returns {Object}
@@ -503,17 +555,22 @@ function updateEventListeners() {
     eventSource.removeListener(event_types.MESSAGE_RECEIVED, onMessageReceived);
     eventSource.removeListener(event_types.CHAT_CHANGED, onChatChanged);
 
-    // Reset operation state
-    operationState.generationInProgress = false;
-    operationState.extractionInProgress = false;
-    operationState.retrievalInProgress = false;
-    operationState.pendingInjectionUpdate = false;
+    // Reset operation state only if no generation in progress
+    // This prevents race conditions when user toggles settings mid-generation
+    if (!operationState.generationInProgress) {
+        operationState.extractionInProgress = false;
+        operationState.retrievalInProgress = false;
+        operationState.pendingInjectionUpdate = false;
+    } else {
+        log('Warning: Settings changed during generation, keeping locks');
+    }
 
     // Add listeners if enabled and automatic mode is on
     if (settings.enabled && settings.automaticMode) {
         // GENERATION_AFTER_COMMANDS: Fires after slash commands but BEFORE generation
-        // This is the correct hook point - same as Quick Replies uses
+        // Use makeFirst to ensure we run before other handlers and block generation
         eventSource.on(event_types.GENERATION_AFTER_COMMANDS, onBeforeGeneration);
+        eventSource.makeFirst(event_types.GENERATION_AFTER_COMMANDS, onBeforeGeneration);
         // GENERATION_ENDED: Clear generation lock, process pending updates
         eventSource.on(event_types.GENERATION_ENDED, onGenerationEnded);
         // MESSAGE_RECEIVED: Extract after AI responds (LLM call happens here, safely after generation)
@@ -534,7 +591,7 @@ function updateEventListeners() {
  * Clears the generation lock and processes any pending updates
  */
 function onGenerationEnded() {
-    operationState.generationInProgress = false;
+    clearGenerationLock(); // Use helper that also clears safety timeout
     log('Generation ended, clearing lock');
 
     // If there was a pending injection update, do it now
@@ -660,42 +717,66 @@ async function onMessageReceived(messageId) {
  * ST awaits async handlers, so retrieval completes before generation proceeds
  */
 async function onBeforeGeneration(generationType, options = {}, isDryRun = false) {
+    const startTime = Date.now();
+    log(`>>> BEFORE_GENERATION START [type=${generationType}, dryRun=${isDryRun}]`);
+
     const settings = extension_settings[extensionName];
-    if (!settings.enabled || !settings.automaticMode) return;
+    if (!settings.enabled || !settings.automaticMode) {
+        log(`>>> BEFORE_GENERATION END (disabled) [${Date.now() - startTime}ms]`);
+        return;
+    }
 
     // Skip dry runs (just calculating token counts, not actual generation)
     if (isDryRun) {
-        log('Before-generation hook skipped due to dryRun');
+        log(`>>> BEFORE_GENERATION END (dryRun) [${Date.now() - startTime}ms]`);
         return;
     }
 
-    const context = getContext();
-    const chat = context.chat || [];
-
-    // Only proceed if the last message was from the user (not a swipe/regenerate)
-    const lastMessage = chat[chat.length - 1];
-    if (!lastMessage || !lastMessage.is_user) {
-        log('Before-generation: last message is not from user, skipping');
+    // Only proceed for normal generation (user sent a message)
+    // Skip swipes and regenerates - they should use existing injection
+    if (generationType === 'swipe' || generationType === 'regenerate') {
+        log(`>>> BEFORE_GENERATION END (${generationType}, using existing) [${Date.now() - startTime}ms]`);
         return;
     }
 
-    // Prevent concurrent operations
+    // Set generation lock FIRST to prevent race conditions
+    setGenerationLock();
+
+    // Check if retrieval is already in progress
     if (operationState.retrievalInProgress) {
-        log('Retrieval already in progress, using existing injection');
+        log(`>>> BEFORE_GENERATION END (retrieval already in progress) [${Date.now() - startTime}ms]`);
+        // Don't clear generation lock - let it time out or be cleared by GENERATION_ENDED
         return;
     }
 
-    operationState.generationInProgress = true;
     operationState.retrievalInProgress = true;
 
+    // Capture the pending user message from textarea
+    // At GENERATION_AFTER_COMMANDS, the user's message is still in textarea, not yet in chat
+    const pendingUserMessage = String($('#send_textarea').val()).trim();
+    if (pendingUserMessage) {
+        log(`>>> Pending user message: "${pendingUserMessage.substring(0, 50)}..."`);
+    }
+
     try {
-        log('Before generation, performing retrieval (smart if enabled)...');
-        // ST awaits this handler, so the LLM call will complete before generation proceeds
-        await updateInjection();
-        log('Retrieval complete, generation can proceed');
+        log('>>> Starting retrieval...');
+        // Use timeout to prevent hanging forever
+        // Pass pending user message so retrieval AI can see what user just typed
+        await withTimeout(
+            updateInjection(pendingUserMessage),
+            RETRIEVAL_TIMEOUT_MS,
+            'Memory retrieval'
+        );
+        log(`>>> BEFORE_GENERATION END (success) [${Date.now() - startTime}ms]`);
     } catch (error) {
-        console.error('OpenVault: Error during pre-generation retrieval:', error);
-        // Fall back to whatever injection was already set
+        if (error.message.includes('timed out')) {
+            console.warn('OpenVault: Retrieval timed out, proceeding with existing context');
+            log(`>>> BEFORE_GENERATION END (timeout) [${Date.now() - startTime}ms]`);
+        } else {
+            console.error('OpenVault: Error during pre-generation retrieval:', error);
+            log(`>>> BEFORE_GENERATION END (error) [${Date.now() - startTime}ms]`);
+        }
+        // Continue with whatever injection was already set
     } finally {
         operationState.retrievalInProgress = false;
         // Note: generationInProgress stays true until GENERATION_ENDED
@@ -1591,8 +1672,9 @@ function injectContext(contextText) {
  * Update the injection (for automatic mode)
  * This rebuilds and re-injects context based on current state
  * Uses smart retrieval if enabled in settings
+ * @param {string} pendingUserMessage - Optional user message not yet in chat (from textarea during pre-generation)
  */
-async function updateInjection() {
+async function updateInjection(pendingUserMessage = '') {
     const settings = extension_settings[extensionName];
 
     // Clear injection if disabled or not in automatic mode
@@ -1656,11 +1738,18 @@ async function updateInjection() {
     const primaryCharacter = isGroupChat ? povCharacters[0] : context.name2;
 
     // Get recent context for relevance matching
-    const recentMessages = context.chat
+    let recentMessages = context.chat
         .filter(m => !m.is_system)
         .slice(-5)
         .map(m => m.mes)
         .join('\n');
+
+    // Include pending user message if provided (for pre-generation retrieval)
+    // This ensures the retrieval AI can see what the user just typed
+    if (pendingUserMessage) {
+        recentMessages = recentMessages + '\n\n[User is about to say]: ' + pendingUserMessage;
+        log(`Including pending user message in retrieval context`);
+    }
 
     // Select relevant memories - uses smart retrieval if enabled in settings
     const relevantMemories = await selectRelevantMemories(
