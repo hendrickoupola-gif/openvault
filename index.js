@@ -39,6 +39,8 @@ const defaultSettings = {
     // Auto-hide settings
     autoHideEnabled: true,         // Automatically hide old messages from context
     autoHideThreshold: 50,         // Keep last N messages visible (hide older ones)
+    // Backfill settings
+    backfillMaxRPM: 30,            // Maximum requests per minute during backfill (rate limiting)
 };
 
 // Operation state machine to prevent concurrent operations
@@ -57,6 +59,11 @@ let generationLockTimeout = null;
 // Input interceptor state
 let inputInterceptorInstalled = false;
 let enterKeyHandler = null;
+
+// Chat loading state - prevents operations during initial chat load
+// Start with cooldown active to prevent any operations before APP_READY completes
+let chatLoadingCooldown = true;
+let chatLoadingTimeout = null;
 
 /**
  * Wrap a promise with a timeout
@@ -233,6 +240,14 @@ function bindUIElements() {
         saveSettingsDebounced();
     });
 
+    // Backfill rate limit input
+    $('#openvault_backfill_rpm').on('change', function() {
+        const value = parseInt($(this).val()) || 30;
+        settings.backfillMaxRPM = Math.max(1, Math.min(600, value));
+        $(this).val(settings.backfillMaxRPM);
+        saveSettingsDebounced();
+    });
+
     // Manual action buttons
     $('#openvault_extract_btn').on('click', () => extractMemories());
     $('#openvault_retrieve_btn').on('click', () => retrieveAndInjectContext());
@@ -295,6 +310,9 @@ function updateUI() {
     $('#openvault_auto_hide').prop('checked', settings.autoHideEnabled);
     $('#openvault_auto_hide_threshold').val(settings.autoHideThreshold);
     $('#openvault_auto_hide_threshold_value').text(settings.autoHideThreshold);
+
+    // Backfill settings
+    $('#openvault_backfill_rpm').val(settings.backfillMaxRPM);
 
     // Populate profile selector
     populateProfileSelector();
@@ -784,10 +802,10 @@ function updateEventListeners(skipInitialization = false) {
 
         log('Automatic mode enabled - input interceptors installed');
 
-        // Initialize the injection (async, handle errors) - skip after backfill to avoid concurrent requests
-        if (!skipInitialization) {
-            updateInjection().catch(err => console.error('OpenVault: Init injection error:', err));
-        } else {
+        // Note: We intentionally do NOT call updateInjection() on initialization anymore.
+        // Retrieval will happen in handleOpenVaultSend() before each user message.
+        // This prevents unwanted LLM calls (smart retrieval) when loading/switching chats.
+        if (skipInitialization) {
             log('Skipping initialization (backfill mode) - retrieval will happen on next generation');
         }
     } else {
@@ -809,12 +827,24 @@ function onGenerationEnded() {
 /**
  * Handle chat changed event
  * Just clears injection - retrieval will happen before next generation
+ * Also sets a cooldown to prevent extraction during chat load
  */
 function onChatChanged() {
     const settings = extension_settings[extensionName];
     if (!settings.enabled || !settings.automaticMode) return;
 
-    log('Chat changed, clearing injection (will refresh on next generation)');
+    log('Chat changed, clearing injection and setting load cooldown');
+
+    // Set cooldown to prevent MESSAGE_RECEIVED from triggering extraction during chat load
+    chatLoadingCooldown = true;
+    if (chatLoadingTimeout) {
+        clearTimeout(chatLoadingTimeout);
+    }
+    // Clear cooldown after 2 seconds - enough time for all messages to be "received"
+    chatLoadingTimeout = setTimeout(() => {
+        chatLoadingCooldown = false;
+        log('Chat load cooldown cleared');
+    }, 2000);
 
     // Clear current injection - it will be refreshed in onBeforeGeneration
     setExtensionPrompt(extensionName, '', extension_prompt_types.IN_CHAT, 0);
@@ -835,6 +865,12 @@ function onChatChanged() {
 async function onMessageReceived(messageId) {
     const settings = extension_settings[extensionName];
     if (!settings.enabled || !settings.automaticMode) return;
+
+    // Don't extract during chat load cooldown (prevents extraction when switching chats)
+    if (chatLoadingCooldown) {
+        log(`Skipping extraction for message ${messageId} - chat load cooldown active`);
+        return;
+    }
 
     // Don't extract during generation or if already extracting
     if (operationState.generationInProgress) {
@@ -1496,9 +1532,12 @@ async function extractAllMessages() {
                 data[EXTRACTED_BATCHES_KEY].push(i);
             }
 
-            // Delay between batches to avoid rate limiting
+            // Delay between batches based on rate limit setting
             if (batchNum < completeBatches) {
-                await new Promise(resolve => setTimeout(resolve, 2000));
+                const rpm = settings.backfillMaxRPM || 30;
+                const delayMs = Math.ceil(60000 / rpm);
+                log(`Rate limiting: waiting ${delayMs}ms (${rpm} RPM)`);
+                await new Promise(resolve => setTimeout(resolve, delayMs));
             }
         } catch (error) {
             console.error('[OpenVault] Batch extraction error:', error);
@@ -2384,6 +2423,17 @@ jQuery(async () => {
     eventSource.on(event_types.APP_READY, async () => {
         await loadSettings();
         registerCommands();
+
+        // Set cooldown during initial load to prevent extraction from MESSAGE_RECEIVED events
+        chatLoadingCooldown = true;
+        if (chatLoadingTimeout) {
+            clearTimeout(chatLoadingTimeout);
+        }
+        chatLoadingTimeout = setTimeout(() => {
+            chatLoadingCooldown = false;
+            log('Initial load cooldown cleared');
+        }, 2000);
+
         updateEventListeners();
         setStatus('ready');
         log('Extension initialized');
