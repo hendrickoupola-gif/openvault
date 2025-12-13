@@ -35,7 +35,7 @@ const defaultSettings = {
     // Phase 6 settings
     messagesPerExtraction: 5,      // Number of messages to analyze per extraction
     memoryContextCount: -1,        // Number of recent memories to include in extraction prompt (-1 = all)
-    smartRetrievalEnabled: false,  // Use LLM to select relevant memories
+    smartRetrievalEnabled: true,  // Use LLM to select relevant memories
     // Auto-hide settings
     autoHideEnabled: true,         // Automatically hide old messages from context
     autoHideThreshold: 50,         // Keep last N messages visible (hide older ones)
