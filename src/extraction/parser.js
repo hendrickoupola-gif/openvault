@@ -48,6 +48,8 @@ export function parseExtractionResult(jsonString, messages, characterName, userN
             importance: Math.min(5, Math.max(1, event.importance || 3)), // Clamp to 1-5, default 3
             emotional_impact: event.emotional_impact || {},
             relationship_impact: event.relationship_impact || {},
+            from: event.from || "",
+            until: event.until || ""
         }));
     } catch (error) {
         log(`Failed to parse extraction result: ${error.message}`);

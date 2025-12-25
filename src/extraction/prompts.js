@@ -67,6 +67,8 @@ Extract NEW significant events from these messages. Use the Character Context (i
 7. **is_secret**: Whether this information should only be known by witnesses
 8. **emotional_impact**: Object mapping character names to emotional changes (e.g., {"${characterName}": "growing trust", "${userName}": "surprised"})
 9. **relationship_impact**: Object describing relationship changes (e.g., {"${characterName}->${userName}": "trust increased"})
+10. **from**: Date and time of the start of the event as ISO 8601 formatted string.
+11. **until**: Date and time of the end of the event as ISO 8601 formatted string.
 
 Only extract events that are significant for character memory and story continuity. Skip mundane exchanges.
 ${existingMemories.length > 0 ? 'Do NOT duplicate events from the "Previously Established Memories" section.' : ''}
@@ -83,7 +85,9 @@ Respond with a JSON array of events:
     "location": "...",
     "is_secret": false,
     "emotional_impact": {...},
-    "relationship_impact": {...}
+    "relationship_impact": {...},
+    "from": "...",
+    "until": "..."
   }
 ]
 \`\`\`

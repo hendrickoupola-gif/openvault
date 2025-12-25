@@ -111,7 +111,7 @@ export function formatContextForInjection(memories, relationships, emotionalInfo
             // Importance indicator: star for each level (1-5)
             const importance = memory.importance || 3;
             const importanceLabel = '\u2605'.repeat(importance);
-            lines.push(`${index + 1}. ${msgLabel} [${importanceLabel}] ${prefix}${memory.summary}`);
+            lines.push(`${index + 1}. ${msgLabel} [${importanceLabel}] ${prefix} ${memory.from}${memory.until === '' ? '' : ' - '}${memory.until}: ${memory.summary}`);
         });
     }
 
